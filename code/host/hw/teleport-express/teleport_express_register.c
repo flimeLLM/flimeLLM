@@ -1,0 +1,359 @@
+#include "hw/teleport-express/express_device_common.h"
+
+#include "hw/teleport-express/teleport_express_register.h"
+
+#include "qemu/atomic.h"
+
+#include "hw/teleport-express/express_log.h"
+#include "hw/teleport-express/express_event.h"
+
+static VirtIODevice *in_teleport_express = NULL;
+
+static Teleport_Express_Call *call_recycle_queue[(CALL_BUF_SIZE + 2)];
+static volatile int call_recycle_queue_header = 0;
+static volatile int call_recycle_queue_tail = 0;
+
+static bool need_send_irq = false;
+
+bool now_can_set_event = true;
+#ifdef _WIN32
+HANDLE input_event = NULL;
+#else
+void *input_event = NULL;
+#endif
+
+void send_express_device_irq(Teleport_Express_Call *irq_call, int buf_index, int len);
+void common_device_irq_register(Device_Context *device_context, Teleport_Express_Call *irq_call);
+void common_device_irq_release(Device_Context *device_context);
+
+static void send_device_prop_to_guest(Express_Device_Info *device_info, Teleport_Express_Call *call)
+{
+    Call_Para paras[10];
+    int para_num = get_para_from_call(call, paras, 10);
+    if (unlikely(para_num != 1 || paras[0].data_len < device_info->static_prop_size))
+    {
+        printf("error! get_device_prop get %d para_num id %u data_len %d prop_size %d\n", para_num, GET_FUN_ID(call->id), (int)paras[0].data_len, device_info->static_prop_size);
+        return;
+    }
+
+    write_to_guest_mem(paras[0].data, (void *)device_info->static_prop, 0, device_info->static_prop_size);
+
+    call->callback(call, 1);
+}
+
+/**
+
+ *
+ * @param call
+ */
+static void push_to_device(Teleport_Express_Call *call)
+{
+
+    uint64_t thread_id = call->thread_id;
+    uint64_t process_id = call->process_id;
+    uint64_t unique_id = call->unique_id;
+
+    uint64_t device_id = GET_DEVICE_ID(call->id);
+    uint64_t fun_id = GET_FUN_ID(call->id);
+
+    Express_Device_Info *device_info = get_express_device_info(device_id);
+    if (device_info == NULL || (device_info->device_type & INPUT_DEVICE_TYPE) == 0)
+    {
+        printf("something bad happened(when input) %llu %llu\n", device_id, fun_id);
+        call->callback(call, 0);
+        return;
+    }
+    LOGD("push to %s device %llx id %llx\n", device_info->name, device_id, call->id);
+
+    Device_Context *device_context = device_info->get_device_context(device_id, thread_id, process_id, unique_id, device_info);
+    if(unlikely(device_context == NULL))
+    {
+        LOGD("device %s: input call received with null device context! call id %llx", device_info->name, call->id);
+        call->callback(call, 0);
+        return;
+    }
+    
+    if (unlikely(device_context->device_info == NULL))
+    {
+        device_context->device_info = device_info;
+    }
+
+    if (fun_id == EXPRESS_REGISTER_BUFFER_FUN_ID)
+    {
+        LOGD("in function of register buffer of device %s", device_info->name);
+        Guest_Mem *data = copy_guest_mem_from_call(call, 1);
+        device_info->buffer_register(data, thread_id, process_id, unique_id);
+        call->callback(call, 0);
+    }
+    else if (fun_id == EXPRESS_IRQ_FUN_ID)
+    {
+        common_device_irq_register(device_context, call);
+    }
+    else if (fun_id == EXPRESS_GET_PROP_FUN_ID && device_info->static_prop != NULL && device_info->static_prop_size != 0)
+    {
+        send_device_prop_to_guest(device_info, call);
+    }
+    else if (fun_id == EXPRESS_RELEASE_IRQ_FUN_ID)
+    {
+        common_device_irq_release(device_context);
+        call->callback(call, 1);
+    }
+    else
+    {
+        printf("unknow fun id %llu device %llu\n", fun_id, device_id);
+        call->callback(call, 0);
+    }
+    LOGD("push to %s device %llx id %llx end\n", device_info->name, device_id, call->id);
+    return;
+}
+
+
+/**
+
+ *
+
+
+ */
+static void input_call_release(Teleport_Express_Call *call, int notify)
+{
+
+    LOGD("input call release call id %lld", call->unique_id);
+    common_call_callback(call);
+
+
+    int origin_tail = call_recycle_queue_tail;
+    int t = origin_tail;
+    do
+    {
+        LOGD("in input call release queue full %d", t);
+        while (call_recycle_queue[(t + 1) % (CALL_BUF_SIZE + 2)] != NULL)
+        {
+            t = (t + 1) % (CALL_BUF_SIZE + 2);
+            LOGD("input call release queue full %d", t);
+        }
+    } while (qatomic_cmpxchg(&(call_recycle_queue[(t + 1) % (CALL_BUF_SIZE + 2)]), NULL, call) != NULL);
+
+    qatomic_cmpxchg(&call_recycle_queue_tail, origin_tail, (t + 1) % (CALL_BUF_SIZE + 2));
+
+    // release_one_call(call, (bool)notify);
+
+    // need_send_irq = true;
+    if (input_event != NULL && now_can_set_event)
+    {
+        set_event(input_event);
+        LOGD("slow input_event!");
+    }
+    else
+    {
+        LOGD("qucik input_event! input event %lld now_can_set_event %d", (long long)input_event, now_can_set_event);
+    }
+
+    return;
+}
+
+void (*get_input_call_release_ptr(void))(Teleport_Express_Call *, int) {
+    return input_call_release;
+}
+
+void realize_input_device(VirtIODevice *vdev)
+{
+    in_teleport_express = vdev;
+    return;
+}
+
+void register_input_buffer_call(VirtIODevice *vdev, VirtQueue *vq)
+{
+    // Teleport_Express_Call *call = get_one_call_from_input_queue(vq);
+    if (unlikely(in_teleport_express == NULL))
+    {
+        in_teleport_express = vdev;
+    }
+
+    Teleport_Express_Call *call = pack_call_from_queue(vq, 1);
+
+    // if (call == NULL)
+    // {
+    //     printf("register get no call\n");
+    // }
+
+    while (call != NULL)
+    {
+        call->callback = input_call_release;
+        call->is_end = 0;
+        call->vdev = in_teleport_express;
+        push_to_device(call);
+
+        call = pack_call_from_queue(vq, 1);
+    }
+
+    express_input_device_sync();
+
+    return;
+}
+
+void send_express_device_irq(Teleport_Express_Call *irq_call, int buf_index, int len)
+{
+    Guest_Mem *mem = irq_call->elem_header->para;
+
+    LOGD("mem is %lld", (uint64_t)mem);
+
+    unsigned long long t_data = ((((uint64_t)buf_index) << 32) + (uint64_t)len);
+    write_to_guest_mem(mem, &t_data, __builtin_offsetof(Teleport_Express_Flag_Buf, ret_data), 8);
+    irq_call->elem_header->written_len =
+        MAX(irq_call->elem_header->written_len,
+            __builtin_offsetof(Teleport_Express_Flag_Buf, ret_data) +
+                sizeof(t_data));
+
+    irq_call->callback(irq_call, 0);
+}
+
+void set_input_event_startup(void) {
+    input_event = create_event(0,0);
+    set_event(input_event);
+
+    need_send_irq = false;
+    call_recycle_queue_header = 0;
+    call_recycle_queue_tail = 0;
+    memset(call_recycle_queue, 0, sizeof(call_recycle_queue));
+}
+
+void *input_sync_thread(void *opaque)
+{
+    input_event = create_event(0, 0);
+    while (!teleport_express_should_stop)
+    {
+
+        int ret = wait_event(input_event, 1);
+        if (ret == 1)
+        {
+            now_can_set_event = true;
+        }
+        else
+        {
+            express_printf("interrupted by event\n");
+            now_can_set_event = false;
+        }
+        Teleport_Express *g = TELEPORT_EXPRESS(in_teleport_express);
+        if (qatomic_cmpxchg(&(g->register_input_vq_locker), 0, 1) == 0)
+        {
+            register_input_buffer_call(in_teleport_express, g->in_data_queue);
+            qatomic_set(&(g->register_input_vq_locker), 0);
+        }
+    }
+    delete_event(input_event);
+    return NULL;
+}
+
+void express_input_device_sync(void)
+{
+    while (call_recycle_queue[(call_recycle_queue_header + 1) % (CALL_BUF_SIZE + 2)] != NULL)
+    {
+        Teleport_Express_Call *out_call = call_recycle_queue[(call_recycle_queue_header + 1) % (CALL_BUF_SIZE + 2)];
+        call_recycle_queue[(call_recycle_queue_header + 1) % (CALL_BUF_SIZE + 2)] = NULL;
+        // Teleport_Express_Call *out_call=atomic_xchg(&call_recycle_queue[(call_recycle_queue_header+1)%(CALL_BUF_SIZE+2)],NULL);
+        call_recycle_queue_header = (call_recycle_queue_header + 1) % (CALL_BUF_SIZE + 2);
+
+        release_one_call(out_call, false);
+
+        need_send_irq = true;
+    }
+
+    if (need_send_irq)
+    {
+        virtio_notify(VIRTIO_DEVICE(in_teleport_express), TELEPORT_EXPRESS(in_teleport_express)->in_data_queue);
+        need_send_irq = false;
+        // printf("input sync\n");
+    }
+}
+
+void common_device_irq_register(Device_Context *device_context, Teleport_Express_Call *irq_call)
+{
+    LOGD("irq register %s", device_context->device_info->name);
+
+    Teleport_Express_Call *origin_call = NULL;
+    if ((origin_call = qatomic_xchg(&device_context->irq_call, irq_call)) != NULL)
+    {
+        if (origin_call == (void *)1)
+        {
+            LOGI("error! %s register with half-released status get one release 1!\n", device_context->device_info->name);
+
+
+            if ((origin_call = qatomic_xchg(&device_context->irq_call, NULL)) != NULL)
+            {
+
+                if (origin_call == (void *)1)
+                {
+                    LOGE("error! %s register with half-released status get one release 1!\n", device_context->device_info->name);
+                    return;
+                }
+                send_express_device_irq(origin_call, 0, 0);
+                LOGI("%s release bewteen send and reset", device_context->device_info->name);
+                return;
+            }
+        }
+    }
+    device_context->irq_enabled = true;
+    if(device_context->device_info->irq_register != NULL)
+    {
+
+        device_context->device_info->irq_register(device_context);
+    }
+}
+
+void common_device_irq_release(Device_Context *device_context)
+{
+    device_context->irq_enabled = false;
+
+    LOGI("irq release %s", device_context->device_info->name);
+
+    Teleport_Express_Call *origin_call = NULL;
+    if ((origin_call = qatomic_xchg(&device_context->irq_call, 1)) != NULL)
+    {
+        if (origin_call != (void *)1)
+        {
+            send_express_device_irq(origin_call, 0, 0);
+
+
+
+            qatomic_xchg(&device_context->irq_call, NULL);
+            LOGD("%s irq_release", device_context->device_info->name);
+        }
+        else
+        {
+            LOGE("error! %s release twice!", device_context->device_info->name);
+        }
+    }
+
+    if(device_context->device_info->irq_release != NULL)
+    {
+        device_context->device_info->irq_release(device_context);
+    }
+}
+
+
+int set_express_device_irq(Device_Context *device_context, int buf_index, int len)
+{
+    if (!device_context->irq_enabled)
+    {
+        LOGW("%s irq is not enabled!", device_context->device_info->name);
+        return IRQ_NOT_ENABLE;
+    }
+
+    Teleport_Express_Call *origin_call = NULL;
+    if ((origin_call = qatomic_xchg(&device_context->irq_call, NULL)) == NULL)
+    {
+        LOGW("%s irq not ok!", device_context->device_info->name);
+        return IRQ_NOT_READY;
+    }
+
+    if (origin_call == (void *)1)
+    {
+        LOGW("%s has been released!", device_context->device_info->name);
+        return IRQ_RELEASED;
+    }
+
+    express_printf("%s irq send ok!\n", device_context->device_info->name);
+    send_express_device_irq(origin_call, buf_index, len);
+
+    return IRQ_SET_OK;
+}
